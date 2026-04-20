@@ -1,44 +1,52 @@
 import streamlit as st
 from db import Database
-import openai
+
+import os
+from openai import OpenAI
 import json
 import config
 import time
 
-openai.api_key = config.API_KEY
-openai.api_base = config.BASE_URL
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY", "sk-23e4dbfe8f5747d090c7b9458c24a314"),
+    base_url="https://api.deepseek.com/v1",
+)
 
 def parse_textbook_content(text, max_retries=3):
     for attempt in range(max_retries):
         try:
-            response = openai.chat.completions.create(
+            # --- 核心改进 2：调用方式改为 client ---
+            response = client.chat.completions.create(
                 model=config.MODEL_NAME,
                 messages=[
                     {
-                        "role": "system",
-                        "content": """你是一个语文知识点提取助手。请从课文中提取颗粒化的知识点，包括生字、词语、重点句子。
-每个知识点需要包含：
-- content: 内容
-- type: 类型（char/word/sentence/poetry）
-- pinyin: 拼音（仅对生字和词语）
-- difficulty: 难度等级（1-5）
-
-请以JSON数组格式返回结果。"""
+                        "role": "system", 
+                        "content": "你是一个语文知识点提取助手。请从课文中提取生字、词语、重点句子。必须仅返回JSON数组，不要包含Markdown标签。格式示例：[{\"content\":\"词语\",\"type\":\"word\",\"pinyin\":\"ci yu\",\"difficulty\":2}]"
                     },
                     {
-                        "role": "user",
-                        "content": f"请从以下课文中提取知识点：{text}"
+                        "role": "user", 
+                        "content": f"请提取：{text}"
                     }
                 ],
                 timeout=60
             )
             result_text = response.choices[0].message.content
+            
+            # --- 核心改进 3：防止 Markdown 标签干扰 ---
+            if "```" in result_text:
+                result_text = result_text.split("```")[1]
+                if result_text.startswith("json"):
+                    result_text = result_text[4:]
+                result_text = result_text.split("```")[0].strip()
+            
             return json.loads(result_text)
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(2)
                 continue
-            raise Exception(f"API调用失败: {str(e)}")
+            # 在这里打印出具体的错误，方便我们定位
+            st.error(f"详细错误诊断: {type(e).__name__} - {str(e)}")
+            raise e
 
 @st.cache_resource
 def init_db():
