@@ -6,11 +6,134 @@ from openai import OpenAI
 import json
 import config
 import time
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.units import cm
+import qrcode
+import io
+import base64
+from datetime import datetime
 
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY", "sk-23e4dbfe8f5747d090c7b9458c24a314"),
     base_url="https://api.deepseek.com/v1",
 )
+
+def generate_exercise():
+    conn = db.connect()
+    cursor = conn.cursor()
+    
+    # 优先选择错误率高或从未复习的词
+    # 1. 从未复习的词
+    cursor.execute('''
+        SELECT v.id, v.content, v.pinyin, v.type, v.difficulty
+        FROM vocabulary v
+        LEFT JOIN learning_progress lp ON v.id = lp.vocabulary_id
+        WHERE lp.vocabulary_id IS NULL
+        ORDER BY v.difficulty DESC
+        LIMIT 10
+    ''')
+    never_reviewed = cursor.fetchall()
+    
+    # 2. 错误率高的词
+    cursor.execute('''
+        SELECT v.id, v.content, v.pinyin, v.type, v.difficulty
+        FROM vocabulary v
+        JOIN learning_progress lp ON v.id = lp.vocabulary_id
+        WHERE lp.error_count > 0
+        ORDER BY lp.error_count DESC
+        LIMIT 10
+    ''')
+    high_error = cursor.fetchall()
+    
+    # 3. 其他词
+    cursor.execute('''
+        SELECT v.id, v.content, v.pinyin, v.type, v.difficulty
+        FROM vocabulary v
+        LEFT JOIN learning_progress lp ON v.id = lp.vocabulary_id
+        ORDER BY RANDOM()
+        LIMIT 10
+    ''')
+    other_words = cursor.fetchall()
+    
+    # 合并并去重
+    all_words = {}
+    for word in never_reviewed + high_error + other_words:
+        all_words[word[0]] = word
+    
+    # 取前20个
+    selected_words = list(all_words.values())[:20]
+    conn.close()
+    
+    return selected_words
+
+def generate_pdf(exercises, student_name, task_id):
+    buffer = io.BytesIO()
+    p = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    
+    # 注册中文字体
+    try:
+        pdfmetrics.registerFont(TTFont('SimSun', 'C:/Windows/Fonts/simsun.ttc'))
+        font_normal = 'SimSun'
+    except:
+        font_normal = 'Helvetica'
+    
+    # 标题
+    p.setFont('Helvetica-Bold', 16)
+    p.drawString(100, height - 50, 'Literacy Practice Sheet')
+    
+    # 姓名日期
+    p.setFont('Helvetica', 12)
+    p.drawString(50, height - 80, f'Name: {student_name}')
+    p.drawString(50, height - 95, f'Date: {datetime.now().strftime("%Y-%m-%d")}')
+    p.drawString(50, height - 110, f'Task ID: {task_id}')
+    
+    # 二维码
+    qr = qrcode.QRCode(version=1, box_size=5, border=2)
+    qr.add_data(f'task_id:{task_id}')
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    img.save('qr_temp.png')
+    p.drawImage('qr_temp.png', width - 100, height - 90, width=60, height=60)
+    os.remove('qr_temp.png')
+    
+    # 练习内容
+    p.setFont('Helvetica-Bold', 14)
+    p.drawString(50, height - 150, 'Practice Questions:')
+    
+    y = height - 180
+    for i, exercise in enumerate(exercises[:20], 1):
+        content = str(exercise[1])
+        pinyin = str(exercise[2]) if len(exercise) > 2 else ''
+        
+        p.setFont('Helvetica', 8)
+        p.drawString(50, y, f'{i}.')
+        
+        p.setFont('Helvetica', 10)
+        p.drawString(70, y, pinyin)
+        y -= 15
+        
+        p.setFont(font_normal, 12)
+        p.drawString(70, y, content)
+        y -= 20
+        
+        # 下划线
+        for _ in range(3):
+            p.line(70, y, width - 50, y)
+            y -= 15
+        
+        y -= 10
+        
+        if y < 100:
+            p.showPage()
+            y = height - 50
+    
+    p.save()
+    buffer.seek(0)
+    return buffer
 
 def parse_textbook_content(text, max_retries=3):
     for attempt in range(max_retries):
@@ -86,7 +209,37 @@ if page == '数据库状态检查':
 # 今日任务页面
 elif page == '今日任务':
     st.header('今日任务')
-    st.write('今日练习任务将在这里显示')
+    
+    student_name = st.text_input('学生姓名')
+    
+    if st.button('生成今日练习单', type='primary'):
+        if not student_name:
+            st.error('请输入学生姓名')
+        else:
+            with st.spinner('正在生成练习单...'):
+                # 生成练习内容
+                exercises = generate_exercise()
+                
+                if not exercises:
+                    st.error('没有可用的知识点，请先在后台录入')
+                else:
+                    # 生成任务ID
+                    task_id = f"{student_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    
+                    # 生成PDF
+                    pdf_output = generate_pdf(exercises, student_name, task_id)
+                    
+                    # 转换为Base64以便下载
+                    b64 = base64.b64encode(pdf_output.read()).decode('utf-8')
+                    href = f'<a href="data:application/pdf;base64,{b64}" download="练习单_{task_id}.pdf">下载练习单</a>'
+                    
+                    st.success('练习单生成成功！')
+                    st.markdown(href, unsafe_allow_html=True)
+                    
+                    # 显示练习内容预览
+                    st.subheader('练习内容预览')
+                    for i, exercise in enumerate(exercises, 1):
+                        st.write(f"{i}. {exercise[1]} ({exercise[2]})")
 
 # 上传批改页面
 elif page == '上传批改':
